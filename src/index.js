@@ -89,6 +89,16 @@ export default class MyFS {
         return fs.dirtree(path);
     }
 
+    async download(uri) {
+        const { fs, path } = this._get(uri);
+        
+        if (typeof fs.download !== 'function') {
+            throw new Error(`Download not supported for filesystem: ${this.parse(uri).provider}`);
+        }
+
+        return fs.download(path);
+    }
+
     async copy(sourceUri, destinationUri) {
 
         const source = this._get(sourceUri);

@@ -15,8 +15,8 @@ export class OpfsFileSystem {
             };
 
             for await (const [childName, childHandle] of dirHandle.entries()) {
-                const childpath = currentPath === "/" 
-                    ? `/${childName}` 
+                const childpath = currentPath === "/"
+                    ? `/${childName}`
                     : `${currentPath}/${childName}`;
 
                 if (childHandle.kind === "file") {
@@ -34,7 +34,7 @@ export class OpfsFileSystem {
             return node;
         }
 
-        const clean = path === "/" ? [] : path.split("/").filter(Boolean);
+        const clean = this._parsePath(path);
         let start = root;
         for (const p of clean) {
             start = await start.getDirectoryHandle(p);
@@ -48,8 +48,7 @@ export class OpfsFileSystem {
         const root = await navigator.storage.getDirectory();
         let dir = root;
 
-        path = path || "/";
-        const clean = path === "/" ? [] : path.split("/").filter(Boolean);
+        const clean = this._parsePath(path);
 
         for (const p of clean) {
             dir = await dir.getDirectoryHandle(p);
@@ -73,8 +72,7 @@ export class OpfsFileSystem {
         const root = await navigator.storage.getDirectory();
         let dir = root;
 
-        path = path || "/";
-        const clean = path === "/" ? [] : path.split("/").filter(Boolean);
+        const clean = this._parsePath(path);
 
         for (const p of clean) {
             dir = await dir.getDirectoryHandle(p, { create: true });
@@ -85,8 +83,7 @@ export class OpfsFileSystem {
     async rmdir(path, options = {}) {
         const root = await navigator.storage.getDirectory();
 
-        path = path || "/";
-        const clean = path === "/" ? [] : path.split("/").filter(Boolean);
+        const clean = this._parsePath(path);
 
         if (clean.length === 0) {
             throw new Error("Cannot remove root directory");
@@ -119,13 +116,108 @@ export class OpfsFileSystem {
         return "ok";
     }
 
-    // Utilities
+    async download(path) {
+        path = path.replace("opfs://", "");
+
+        const root = await navigator.storage.getDirectory();
+        let handle = root;
+        let name = "root";
+
+        if (path && path !== "/") {
+            const clean = this._parsePath(path);
+            const parentPath = clean.slice(0, -1).join("/");
+            const dir = await this._getDirectoryHandle(parentPath);
+            name = clean[clean.length - 1];
+
+            let found = false;
+            for await (const [childName, childHandle] of dir.entries()) {
+                if (childName === name) {
+                    handle = childHandle;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                throw new Error("File or directory not found: " + path);
+            }
+        }
+
+        if (handle.kind === "file") {
+            const file = await handle.getFile();
+            return {
+                stream: file.stream(),
+                name: file.name,
+                type: "file"
+            };
+        } else {
+            // It's a directory
+            const { Zip, ZipDeflate } = await import('fflate');
+
+            let zip;
+            const stream = new ReadableStream({
+                start(controller) {
+                    zip = new Zip((err, data, final) => {
+                        if (err) {
+                            controller.error(err);
+                        } else {
+                            controller.enqueue(data);
+                            if (final) {
+                                controller.close();
+                            }
+                        }
+                    });
+                }
+            });
+
+            // Start pushing files into zip asynchronously
+            (async () => {
+                try {
+                    async function walk(dirHandle, currentPath) {
+                        for await (const [childName, childHandle] of dirHandle.entries()) {
+                            const childpath = currentPath ? `${currentPath}/${childName}` : childName;
+                            if (childHandle.kind === "file") {
+                                const file = await childHandle.getFile();
+                                const zipStream = new ZipDeflate(childpath);
+                                zip.add(zipStream);
+
+                                const reader = file.stream().getReader();
+                                while (true) {
+                                    const { done, value } = await reader.read();
+                                    if (done) break;
+                                    zipStream.push(value);
+                                }
+                                zipStream.push(new Uint8Array(0), true);
+                            } else {
+                                await walk(childHandle, childpath);
+                            }
+                        }
+                    }
+                    await walk(handle, "");
+                    zip.end();
+                } catch (err) {
+                    console.error("Zip generation error:", err);
+                }
+            })();
+
+            return {
+                stream,
+                name: `${name}.zip`,
+                type: "directory"
+            };
+        }
+    }
+
+    // Utilities    
+    _parsePath(path) {
+        if (!path || path === "/") return [];
+        return path.replace("opfs://", "").split("/").filter(Boolean);
+    }
+
     async _getDirectoryHandle(path, options) {
         const root = await navigator.storage.getDirectory();
         let dir = root;
 
-        path = path || "/";
-        const clean = path === "/" ? [] : path.split("/").filter(Boolean);
+        const clean = this._parsePath(path);
 
         for (const p of clean) {
             dir = await dir.getDirectoryHandle(p);
@@ -137,13 +229,12 @@ export class OpfsFileSystem {
         const root = await navigator.storage.getDirectory();
         let dir = root;
 
-        path = path || "/";
-        const clean = path === "/" ? [] : path.split("/").filter(Boolean);
-        
+        const clean = this._parsePath(path);
+
         let file;
         for (let i = 0; i < clean.length; i++) {
             let p = clean[i];
-            if(i === clean.length - 1) {
+            if (i === clean.length - 1) {
                 file = await dir.getFileHandle(p, options);
             } else {
                 dir = await dir.getDirectoryHandle(p, options);
