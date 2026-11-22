@@ -137,7 +137,7 @@ export class OpfsFileSystem {
         await _walk(dirHandle, normalizedPath);
     }
 
-    async download(path) {
+    async download(path, options = {}) {
         path = path.replace("opfs://", "");
 
         const clean = this._parsePath(path);
@@ -163,23 +163,96 @@ export class OpfsFileSystem {
             }
         }
 
+        const format = options.format || (handle.kind === "file" ? "raw" : "zip");
+        const bufferSize = options.bufferSize ?? (512 * 1024);
+
         if (handle.kind === "file") {
             const file = await handle.getFile();
+            let stream = file.stream();
+            let outName = file.name;
+            const lowerName = file.name.toLowerCase();
+            const alreadyCompressed =
+                (format === "zip" && lowerName.endsWith(".zip")) ||
+                (format === "gzip" && (lowerName.endsWith(".gz") || lowerName.endsWith(".gzip"))) ||
+                (format === "zstd" && lowerName.endsWith(".zst")) ||
+                (format === "deflate" && lowerName.endsWith(".zz")) ||
+                (format === "deflate-raw" && lowerName.endsWith(".deflate"));
+
+            if (!alreadyCompressed && format === "gzip") {
+                const { GzipStreamTransformer, BufferedStreamTransformer } = await import('./compress.js');
+                stream = stream
+                    .pipeThrough(new GzipStreamTransformer(options))
+                    .pipeThrough(new BufferedStreamTransformer({ bufferSize }));
+                outName = `${file.name}.gz`;
+            } else if (!alreadyCompressed && format === "deflate") {
+                const { DeflateStreamTransformer, BufferedStreamTransformer } = await import('./compress.js');
+                stream = stream
+                    .pipeThrough(new DeflateStreamTransformer(options))
+                    .pipeThrough(new BufferedStreamTransformer({ bufferSize }));
+                outName = `${file.name}.zz`;
+            } else if (!alreadyCompressed && format === "deflate-raw") {
+                const { DeflateRawStreamTransformer, BufferedStreamTransformer } = await import('./compress.js');
+                stream = stream
+                    .pipeThrough(new DeflateRawStreamTransformer(options))
+                    .pipeThrough(new BufferedStreamTransformer({ bufferSize }));
+                outName = `${file.name}.deflate`;
+            } else if (!alreadyCompressed && format === "zip") {
+                const { ZipStreamTransformer, BufferedStreamTransformer } = await import('./compress.js');
+                const fileStream = new ReadableStream({
+                    async pull(controller) {
+                        controller.enqueue({ type: "file-start", path: file.name });
+                        const reader = file.stream().getReader();
+                        const dataChunk = { type: "file-data", data: null };
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            dataChunk.data = value;
+                            controller.enqueue(dataChunk);
+                        }
+                        controller.enqueue({ type: "file-end" });
+                        controller.close();
+                    }
+                });
+                stream = fileStream
+                    .pipeThrough(new ZipStreamTransformer(options))
+                    .pipeThrough(new BufferedStreamTransformer({ bufferSize }));
+                outName = `${file.name}.zip`;
+            } else if (!alreadyCompressed && format === "zstd") {
+                // ZstdStreamTransformer has built-in 512KB output buffering —
+                // no BufferedStreamTransformer needed.
+                const { ZstdStreamTransformer } = await import('./compress.js');
+                stream = stream.pipeThrough(new ZstdStreamTransformer(options));
+                outName = `${file.name}.zst`;
+            }
+
             return {
-                stream: file.stream(),
-                name: file.name,
+                stream,
+                name: outName,
                 type: "file"
             };
         } else {
-            // Directory → stream as zip via OpfsReadableStream + ZipStreamTransformer
-            const { ZipStreamTransformer } = await import('./compress.js');
             const normalizedRoot = (!path || path === "/") ? "/" : `/${clean.join("/")}`;
-
             const opfsStream = new OpfsReadableStream(this, normalizedRoot);
-            const zipStream = opfsStream.pipeThrough(new ZipStreamTransformer());
 
+            if (format === "zstd") {
+                // Directories: zip first, then zstd-compress the archive.
+                // ZstdStreamTransformer has built-in buffering — no BufferedStreamTransformer needed.
+                const { ZipStreamTransformer, ZstdStreamTransformer } = await import('./compress.js');
+                return {
+                    stream: opfsStream
+                        .pipeThrough(new ZipStreamTransformer(options))
+                        .pipeThrough(new ZstdStreamTransformer(options)),
+                    name: `${name}.zip.zst`,
+                    type: "directory"
+                };
+            }
+
+            // Default directory download: zip with buffered output
+            const { ZipStreamTransformer, BufferedStreamTransformer } = await import('./compress.js');
             return {
-                stream: zipStream,
+                stream: opfsStream
+                    .pipeThrough(new ZipStreamTransformer(options))
+                    .pipeThrough(new BufferedStreamTransformer({ bufferSize })),
                 name: `${name}.zip`,
                 type: "directory"
             };
@@ -263,6 +336,7 @@ export class OpfsReadableStream extends ReadableStream {
                 started = true;
 
                 try {
+                    const dataChunk = { type: "file-data", data: null };
                     await opfs.walk(path, async (dirpath, _dirnames, filenames, dirHandle) => {
                         const relDir = dirpath === path
                             ? ""
@@ -279,7 +353,8 @@ export class OpfsReadableStream extends ReadableStream {
                             while (true) {
                                 const { done, value } = await reader.read();
                                 if (done) break;
-                                controller.enqueue({ type: "file-data", data: value });
+                                dataChunk.data = value;
+                                controller.enqueue(dataChunk);
                             }
 
                             controller.enqueue({ type: "file-end" });

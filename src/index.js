@@ -89,14 +89,14 @@ export default class MyFS {
         return fs.dirtree(path);
     }
 
-    async download(uri) {
+    async download(uri, options = {}) {
         const { fs, path } = this._get(uri);
         
         if (typeof fs.download !== 'function') {
             throw new Error(`Download not supported for filesystem: ${this.parse(uri).provider}`);
         }
 
-        return fs.download(path);
+        return fs.download(path, options);
     }
 
     async copy(sourceUri, destinationUri) {
@@ -120,3 +120,8 @@ export default class MyFS {
         await source.fs.rm(source.path);
     }
 }
+
+export * from "./compress.js";
+export * from "./opfs.js";
+export * from "./local.js";
+export * from "./ftp.js";

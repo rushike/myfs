@@ -5,7 +5,7 @@ A unified filesystem abstraction with support for OPFS, Local File System, and F
 ## Overview
 - **URI Based Approach**: Access any configured file system via a URI prefix (e.g., `opfs://path/to/file`, `file:///local/path`, `ftp://host/file`).
 - **Standard FS APIs**: `mkdir`, `rmdir`, `readFile`, `writeFile`, `listdir`, `dirtree`, `copy`, `move`.
-- **Advanced Features**: Native streaming downloads with automatic on-the-fly zip compression for directories.
+- **Advanced Features**: Native streaming downloads with selectable ZIP, gzip, DEFLATE, and Zstandard formats.
 
 ---
 
@@ -54,8 +54,43 @@ await myfs.move("opfs:///workspace/notes.txt", "opfs:///workspace/important_note
 `myfs` includes a powerful `download(uri)` API designed specifically to handle large files and directories efficiently without blowing up browser memory limits.
 
 ### How it works
-- **Single File**: Returns `{ stream, name, type: "file" }` wrapping the raw file stream.
-- **Directory**: Returns `{ stream, name: "folderName.zip", type: "directory" }`. It recursively traverses the folder, reads files in 64KB chunks, and compresses them on-the-fly using `fflate` directly into the output `ReadableStream`.
+- **Single File**: Returns `{ stream, name, type: "file" }`. The stream is either raw or compressed according to `options.format`.
+- **Directory**: Returns a streamed archive. ZIP is the default. Zstandard is implemented by creating a streamed ZIP archive and then compressing that archive to `.zip.zst`.
+
+### Download formats
+
+Pass `format` explicitly to `myfs.download(uri, { format })`. Supported values are:
+
+| `format` | File extension | Behavior |
+|---|---|---|
+| `raw` | unchanged | Streams the original file; used for files by default |
+| `zip` | `.zip` | Streams the file or directory as a ZIP archive |
+| `gzip` | `.gz` | Compresses a file with gzip |
+| `deflate` | `.zz` | Compresses a file with zlib-wrapped DEFLATE |
+| `deflate-raw` | `.deflate` | Compresses a file with raw DEFLATE |
+| `zstd` | `.zst` for files; `.zip.zst` for directories | Compresses through the bundled Zstandard WASM bridge |
+
+Directories default to ZIP. Files default to raw unless a format is supplied explicitly.
+
+```javascript
+const zip = await myfs.download("opfs:///reports", { format: "zip" });
+const gzip = await myfs.download("opfs:///reports.csv", { format: "gzip" });
+const zstd = await myfs.download("opfs:///reports.csv", { format: "zstd" });
+```
+
+The Zstandard implementation uses `ZstdStreamTransformer` from `src/compress.js` and loads the singleton WASM module through `src/zstd-bridge.js`.
+
+Existing compressed files are not double-compressed: selecting a matching format for a `.zip`, `.gz`/`.gzip`, `.zst`, `.zz`, or `.deflate` file preserves its original name and streams the original bytes unchanged.
+
+### Zstandard artifacts
+
+The source bridge is maintained in `c/my-std-bridge/`. Its compiled `zstd_bridge.js` and `zstd_bridge.wasm` files are synchronized into `js/packages/myfs/wasm/zstd/` by:
+
+```bash
+./doit zstd_bridge
+```
+
+The package loader imports this synchronized WASM directory at runtime and caches the Emscripten module across downloads.
 
 ### Limitations (Backpressure)
 The OPFS implementation reads files and pushes chunks into the compression stream synchronously. If the stream consumer (e.g., a slow network upload pipeline) is much slower than the OPFS disk read speed, the internal stream buffer could build up, negating the memory-saving benefits. 
